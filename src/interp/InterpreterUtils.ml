@@ -66,8 +66,8 @@ let statement_to_string_with_tab ctx =
 let env_elem_to_string span ctx =
   Print.EvalCtx.env_elem_to_string ~span:(Some span) ctx "" "  "
 
-let env_to_string span ctx env =
-  eval_ctx_to_string ~span:(Some span) { ctx with env }
+let env_to_string span ctx ?(filter = true) env =
+  eval_ctx_to_string ~span:(Some span) { ctx with env } ~filter
 
 let abs_to_string span ?(with_ended = false) ctx =
   Print.EvalCtx.abs_to_string ~span:(Some span) ~with_ended ctx "" "  "
@@ -127,7 +127,16 @@ let mk_fresh_symbolic_typed_value_from_no_regions_ty (span : Meta.span)
 let mk_aproj_loans_value_from_symbolic_value (proj_regions : RegionId.Set.t)
     (svalue : symbolic_value) (proj_ty : ty) : typed_avalue =
   if ty_has_regions_in_set proj_regions proj_ty then
-    let av = ASymbolic (PNone, AProjLoans (svalue.sv_id, proj_ty, [])) in
+    let av =
+      ASymbolic
+        ( PNone,
+          AProjLoans
+            {
+              proj = { sv_id = svalue.sv_id; proj_ty };
+              consumed = [];
+              borrows = [];
+            } )
+    in
     let av : typed_avalue = { value = av; ty = svalue.sv_ty } in
     av
   else
@@ -142,21 +151,23 @@ let mk_aproj_borrows_from_symbolic_value (span : Meta.span)
     aproj =
   sanity_check __FILE__ __LINE__ (ty_is_rty proj_ty) span;
   if ty_has_regions_in_set proj_regions proj_ty then
-    AProjBorrows (svalue.sv_id, proj_ty, [])
+    AProjBorrows { proj = { sv_id = svalue.sv_id; proj_ty }; loans = [] }
   else AEmpty
 
 (** TODO: move *)
-let borrow_is_asb (bid : BorrowId.id) (asb : abstract_shared_borrow) : bool =
+let borrow_is_asb (bid : SharedBorrowId.id) (asb : abstract_shared_borrow) :
+    bool =
   match asb with
-  | AsbBorrow bid' -> bid' = bid
+  | AsbBorrow (_, bid') -> bid' = bid
   | AsbProjReborrows _ -> false
 
 (** TODO: move *)
-let borrow_in_asb (bid : BorrowId.id) (asb : abstract_shared_borrows) : bool =
+let borrow_in_asb (bid : SharedBorrowId.id) (asb : abstract_shared_borrows) :
+    bool =
   List.exists (borrow_is_asb bid) asb
 
 (** TODO: move *)
-let remove_borrow_from_asb (span : Meta.span) (bid : BorrowId.id)
+let remove_borrow_from_asb (span : Meta.span) (bid : SharedBorrowId.id)
     (asb : abstract_shared_borrows) : abstract_shared_borrows =
   let removed = ref 0 in
   let asb =
@@ -208,13 +219,10 @@ exception FoundGBorrowContent of g_borrow_content
 exception FoundGLoanContent of g_loan_content
 
 (** Utility exception *)
-exception
-  FoundAProjBorrows of
-    symbolic_value_id * ty * (msymbolic_value_id * aproj) list
+exception FoundAProjBorrows of aproj_borrows
 
 (** Utility exception *)
-exception
-  FoundAProjLoans of symbolic_value_id * ty * (msymbolic_value_id * aproj) list
+exception FoundAProjLoans of aproj_loans
 
 exception FoundAbsProj of abstraction_id * symbolic_value_id
 
@@ -229,8 +237,8 @@ let symbolic_value_id_in_ctx (sv_id : SymbolicValueId.id) (ctx : eval_ctx) :
 
       method! visit_aproj env aproj =
         (match aproj with
-        | AProjLoans (sv_id1, _, _) | AProjBorrows (sv_id1, _, _) ->
-            if sv_id1 = sv_id then raise Found else ()
+        | AProjLoans { proj; _ } | AProjBorrows { proj; _ } ->
+            if proj.sv_id = sv_id then raise Found else ()
         | AEndedProjLoans _ | AEndedProjBorrows _ | AEmpty -> ());
         super#visit_aproj env aproj
 
@@ -238,8 +246,8 @@ let symbolic_value_id_in_ctx (sv_id : SymbolicValueId.id) (ctx : eval_ctx) :
         let visit (asb : abstract_shared_borrow) : unit =
           match asb with
           | AsbBorrow _ -> ()
-          | AsbProjReborrows (sv_id1, _) ->
-              if sv_id1 = sv_id then raise Found else ()
+          | AsbProjReborrows proj ->
+              if proj.sv_id = sv_id then raise Found else ()
         in
         List.iter visit asb
     end
@@ -324,8 +332,6 @@ let rvalue_get_place (rv : rvalue) : place option =
   | NullaryOp _
   | UnaryOp _
   | BinaryOp _
-  | Global _
-  | GlobalRef _
   | Discriminant _
   | Aggregate _
   | Repeat _
@@ -347,11 +353,42 @@ let value_has_loans_or_borrows span (ctx : eval_ctx) (v : value) : bool =
 (** See {!ValuesUtils.value_has_loans}. *)
 let value_has_loans (v : value) : bool = ValuesUtils.value_has_loans v
 
+(** The borrow id of shared borrows doesn't uniquely identify shared borrows:
+    when we need to uniquely identify a borrow, we use the borrow id for mutable
+    borrows, and the shared borrow id for shared borrow (once again, the shared
+    borrow id is just an implementation detail, it doesn't have any impact in
+    the semantics). *)
+type unique_borrow_id = UMut of borrow_id | UShared of shared_borrow_id
+[@@deriving show, ord]
+
+let unique_borrow_id_to_string (uid : unique_borrow_id) : string =
+  match uid with
+  | UMut id -> "m@" ^ BorrowId.to_string id
+  | UShared id -> "s@" ^ SharedBorrowId.to_string id
+
+module UniqueBorrowIdOrderedType :
+  Collections.OrderedType with type t = unique_borrow_id = struct
+  type t = unique_borrow_id
+
+  let compare = compare_unique_borrow_id
+  let to_string = unique_borrow_id_to_string
+  let pp_t = pp_unique_borrow_id
+  let show_t = show_unique_borrow_id
+end
+
+module UniqueBorrowIdMap = Collections.MakeMap (UniqueBorrowIdOrderedType)
+module UniqueBorrowIdSet = Collections.MakeSet (UniqueBorrowIdOrderedType)
+
+type unique_borrow_id_set = UniqueBorrowIdSet.t [@@deriving show, ord]
+
 (** See {!compute_typed_value_ids}, {!compute_context_ids}, etc. *)
 type ids_sets = {
   aids : AbstractionId.Set.t;
   blids : BorrowId.Set.t;  (** All the borrow/loan ids *)
   borrow_ids : BorrowId.Set.t;  (** Only the borrow ids *)
+  unique_borrow_ids : UniqueBorrowIdSet.t;
+      (** Only the borrow ids, where shared borrows are uniquely identified *)
+  shared_borrow_ids : SharedBorrowId.Set.t;
   loan_ids : BorrowId.Set.t;  (** Only the loan ids *)
   dids : DummyVarId.Set.t;
   rids : RegionId.Set.t;
@@ -370,6 +407,8 @@ type ids_to_values = { sids_to_values : symbolic_value SymbolicValueId.Map.t }
 let compute_ids () =
   let blids = ref BorrowId.Set.empty in
   let borrow_ids = ref BorrowId.Set.empty in
+  let unique_borrow_ids = ref UniqueBorrowIdSet.empty in
+  let shared_borrow_ids = ref SharedBorrowId.Set.empty in
   let loan_ids = ref BorrowId.Set.empty in
   let aids = ref AbstractionId.Set.empty in
   let dids = ref DummyVarId.Set.empty in
@@ -382,6 +421,8 @@ let compute_ids () =
       aids = !aids;
       blids = !blids;
       borrow_ids = !borrow_ids;
+      unique_borrow_ids = !unique_borrow_ids;
+      shared_borrow_ids = !shared_borrow_ids;
       loan_ids = !loan_ids;
       dids = !dids;
       rids = !rids;
@@ -389,19 +430,35 @@ let compute_ids () =
     }
   in
   let get_ids_to_values () = { sids_to_values = !sids_to_values } in
+  let add_shared_borrow bid sid =
+    blids := BorrowId.Set.add bid !blids;
+    borrow_ids := BorrowId.Set.add bid !borrow_ids;
+    unique_borrow_ids := UniqueBorrowIdSet.add (UShared sid) !unique_borrow_ids;
+    shared_borrow_ids := SharedBorrowId.Set.add sid !shared_borrow_ids
+  in
   let obj =
     object
       inherit [_] iter_eval_ctx as super
       method! visit_dummy_var_id _ did = dids := DummyVarId.Set.add did !dids
 
+      method! visit_shared_borrow_id _ _ =
+        (* Make sure we don't miss any *)
+        internal_error_opt_span __FILE__ __LINE__ None
+
       method! visit_borrow_id _ id =
         blids := BorrowId.Set.add id !blids;
-        borrow_ids := BorrowId.Set.add id !borrow_ids
+        borrow_ids := BorrowId.Set.add id !borrow_ids;
+        (* All the shared borrows should be caught elsewhere: if we are here, it must be a mutable borrows *)
+        unique_borrow_ids := UniqueBorrowIdSet.add (UMut id) !unique_borrow_ids
 
       method! visit_loan_id _ id =
         blids := BorrowId.Set.add id !blids;
         loan_ids := BorrowId.Set.add id !loan_ids
 
+      method! visit_VSharedBorrow _ bid sid = add_shared_borrow bid sid
+      method! visit_VReservedMutBorrow _ bid sid = add_shared_borrow bid sid
+      method! visit_ASharedBorrow _ _ bid sid = add_shared_borrow bid sid
+      method! visit_AsbBorrow _ bid sid = add_shared_borrow bid sid
       method! visit_abstraction_id _ id = aids := AbstractionId.Set.add id !aids
 
       method! visit_region_id _ _ =
@@ -415,8 +472,8 @@ let compute_ids () =
         | Bound _ -> ()
 
       method! visit_abs_regions _ (regions : abs_regions) : unit =
-        let { owned; ancestors } = regions in
-        rids := RegionId.Set.union (RegionId.Set.union owned ancestors) !rids
+        let { owned } = regions in
+        rids := RegionId.Set.union owned !rids
 
       method! visit_symbolic_value env sv =
         sids := SymbolicValueId.Set.add sv.sv_id !sids;
@@ -473,8 +530,6 @@ let compute_ctx_ids (ctx : eval_ctx) : ids_sets * ids_to_values =
 
 let empty_ids_set = fst (compute_ctxs_ids [])
 
-(** **WARNING**: this function doesn't compute the normalized types (for the
-    trait type aliases). This should be computed afterwards. *)
 let initialize_eval_ctx (span : Meta.span option) (ctx : decls_ctx)
     (region_groups : RegionGroupId.id list) (type_vars : type_var list)
     (const_generic_vars : const_generic_var list) : eval_ctx =
@@ -496,7 +551,6 @@ let initialize_eval_ctx (span : Meta.span option) (ctx : decls_ctx)
     type_vars;
     const_generic_vars;
     const_generic_vars_map;
-    norm_trait_types = TraitTypeRefMap.empty (* Empty for now *);
     env = [ EFrame ];
     ended_regions = RegionId.Set.empty;
   }
@@ -548,8 +602,8 @@ let instantiate_fun_sig (span : Meta.span) (ctx : eval_ctx)
   in
   (* Substitute the signature *)
   let inst_sig =
-    AssociatedTypes.ctx_subst_norm_signature span ctx asubst rsubst tsubst
-      cgsubst tr_subst tr_self sg regions_hierarchy
+    Substitute.substitute_signature asubst rsubst tsubst cgsubst tr_subst
+      tr_self sg regions_hierarchy
   in
   (* Return *)
   inst_sig

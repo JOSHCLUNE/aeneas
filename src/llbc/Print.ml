@@ -96,27 +96,34 @@ module Values = struct
   and borrow_content_to_string ?(span : Meta.span option = None) (env : fmt_env)
       (bc : borrow_content) : string =
     match bc with
-    | VSharedBorrow bid -> "shared_borrow@" ^ BorrowId.to_string bid
+    | VSharedBorrow (bid, sid) ->
+        "shared_borrow@" ^ BorrowId.to_string bid ^ "(^"
+        ^ SharedBorrowId.to_string sid
+        ^ ")"
     | VMutBorrow (bid, tv) ->
         "mut_borrow@" ^ BorrowId.to_string bid ^ " ("
         ^ typed_value_to_string ~span env tv
         ^ ")"
-    | VReservedMutBorrow bid -> "reserved_borrow@" ^ BorrowId.to_string bid
+    | VReservedMutBorrow (bid, sid) ->
+        "reserved_borrow@" ^ BorrowId.to_string bid ^ "(^"
+        ^ SharedBorrowId.to_string sid
+        ^ ")"
 
   and loan_content_to_string ?(span : Meta.span option = None) (env : fmt_env)
       (lc : loan_content) : string =
     match lc with
-    | VSharedLoan (loans, v) ->
-        let loans = BorrowId.Set.to_string None loans in
-        "@shared_loan(" ^ loans ^ ", " ^ typed_value_to_string ~span env v ^ ")"
+    | VSharedLoan (lid, v) ->
+        let lid = BorrowId.to_string lid in
+        "@shared_loan(@" ^ lid ^ ", " ^ typed_value_to_string ~span env v ^ ")"
     | VMutLoan bid -> "ml@" ^ BorrowId.to_string bid
 
   let abstract_shared_borrow_to_string (env : fmt_env)
       (abs : abstract_shared_borrow) : string =
     match abs with
-    | AsbBorrow bid -> BorrowId.to_string bid
-    | AsbProjReborrows (sv_id, rty) ->
-        "{" ^ symbolic_value_proj_to_string env sv_id rty ^ "}"
+    | AsbBorrow (bid, sid) ->
+        BorrowId.to_string bid ^ "(@" ^ SharedBorrowId.to_string sid ^ ")"
+    | AsbProjReborrows proj ->
+        "{" ^ symbolic_value_proj_to_string env proj.sv_id proj.proj_ty ^ "}"
 
   let abstract_shared_borrows_to_string (env : fmt_env)
       (abs : abstract_shared_borrows) : string =
@@ -127,57 +134,77 @@ module Values = struct
   let rec aproj_to_string ?(with_ended : bool = false) (env : fmt_env)
       (pv : aproj) : string =
     match pv with
-    | AProjLoans (sv, rty, given_back) ->
-        let given_back =
-          if given_back = [] then ""
+    | AProjLoans { proj; consumed; borrows } ->
+        let consumed =
+          if consumed = [] then ""
           else
-            let given_back = List.map snd given_back in
-            let given_back =
-              List.map (aproj_to_string ~with_ended env) given_back
+            let consumed = List.map snd consumed in
+            let consumed =
+              List.map (aproj_to_string ~with_ended env) consumed
             in
-            " [" ^ String.concat "," given_back ^ "]"
+            ", consumed=[" ^ String.concat "," consumed ^ "]"
         in
-        "⌊" ^ symbolic_value_proj_to_string env sv rty ^ given_back ^ "⌋"
-    | AProjBorrows (sv, rty, given_back) ->
-        let given_back =
-          if given_back = [] then ""
+        let borrows =
+          if borrows = [] then ""
           else
-            let given_back = List.map snd given_back in
-            let given_back =
-              List.map (aproj_to_string ~with_ended env) given_back
-            in
-            " [" ^ String.concat "," given_back ^ "]"
+            let borrows = List.map snd borrows in
+            let borrows = List.map (aproj_to_string ~with_ended env) borrows in
+            ", borrows=[" ^ String.concat "," borrows ^ "]"
         in
-        "(" ^ symbolic_value_proj_to_string env sv rty ^ given_back ^ ")"
-    | AEndedProjLoans (msv, given_back) ->
+        "⌊"
+        ^ symbolic_value_proj_to_string env proj.sv_id proj.proj_ty
+        ^ consumed ^ borrows ^ "⌋"
+    | AProjBorrows { proj; loans } ->
+        let loans =
+          if loans = [] then ""
+          else
+            let loans = List.map snd loans in
+            let loans = List.map (aproj_to_string ~with_ended env) loans in
+            ", loans=[" ^ String.concat "," loans ^ "]"
+        in
+        "("
+        ^ symbolic_value_proj_to_string env proj.sv_id proj.proj_ty
+        ^ loans ^ ")"
+    | AEndedProjLoans { proj = msv; consumed; borrows } ->
         let msv =
           if with_ended then
             "original_loan = " ^ symbolic_value_id_to_pretty_string msv
           else "_"
         in
-        let given_back = List.map snd given_back in
-        let given_back =
-          List.map (aproj_to_string ~with_ended env) given_back
+        let consumed =
+          if consumed = [] then ""
+          else
+            let consumed = List.map snd consumed in
+            let consumed =
+              List.map (aproj_to_string ~with_ended env) consumed
+            in
+            ", consumed=[" ^ String.concat "," consumed ^ "]"
         in
-        "ended_aproj_loans (" ^ msv ^ ", ["
-        ^ String.concat "," given_back
-        ^ "])"
-    | AEndedProjBorrows (meta, given_back) ->
+        let borrows =
+          if borrows = [] then ""
+          else
+            let borrows = List.map snd borrows in
+            let borrows = List.map (aproj_to_string ~with_ended env) borrows in
+            ", borrows=[" ^ String.concat "," borrows ^ "]"
+        in
+        "ended_aproj_loans (" ^ msv ^ consumed ^ borrows ^ ")"
+    | AEndedProjBorrows { mvalues; loans } ->
         let meta =
           if with_ended then
             "original_borrow = "
-            ^ symbolic_value_id_to_pretty_string meta.consumed
+            ^ symbolic_value_id_to_pretty_string mvalues.consumed
             ^ ", given_back = "
-            ^ symbolic_value_to_string env meta.given_back
+            ^ symbolic_value_to_string env mvalues.given_back
           else "_"
         in
-        let given_back = List.map snd given_back in
-        let given_back =
-          List.map (aproj_to_string ~with_ended env) given_back
+        let loans =
+          if loans = [] then ""
+          else
+            let loans = List.map snd loans in
+            let loans = List.map (aproj_to_string ~with_ended env) loans in
+            ", loans=[" ^ String.concat "," loans ^ "]"
         in
-        "ended_aproj_borrows (" ^ meta ^ ", ["
-        ^ String.concat "," given_back
-        ^ "])"
+        "ended_aproj_borrows (" ^ meta ^ loans ^ "])"
     | AEmpty -> "_"
 
   (** Wrap a value inside its marker, if there is one *)
@@ -252,9 +279,8 @@ module Values = struct
         ^ typed_avalue_to_string ~span ~with_ended env av
         ^ ")"
         |> add_proj_marker pm
-    | ASharedLoan (pm, loans, v, av) ->
-        let loans = BorrowId.Set.to_string None loans in
-        "@shared_loan(" ^ loans ^ ", "
+    | ASharedLoan (pm, lid, v, av) ->
+        "@shared_loan(@" ^ BorrowId.to_string lid ^ ", "
         ^ typed_value_to_string ~span env v
         ^ ", "
         ^ typed_avalue_to_string ~span ~with_ended env av
@@ -303,8 +329,11 @@ module Values = struct
         ^ typed_avalue_to_string ~span ~with_ended env av
         ^ ")"
         |> add_proj_marker pm
-    | ASharedBorrow (pm, bid) ->
-        "sb@" ^ BorrowId.to_string bid |> add_proj_marker pm
+    | ASharedBorrow (pm, bid, sid) ->
+        "sb@" ^ BorrowId.to_string bid ^ "(^"
+        ^ SharedBorrowId.to_string sid
+        ^ ")"
+        |> add_proj_marker pm
     | AIgnoredMutBorrow (opt_bid, av) ->
         "@ignored_mut_borrow("
         ^ option_to_string BorrowId.to_string opt_bid
@@ -409,10 +438,7 @@ module Values = struct
     | SeMutRef (bid, sv) ->
         "MB " ^ BorrowId.to_string bid ^ " " ^ symbolic_value_to_string env sv
     | SeSharedRef (bid, sv) ->
-        "SB {"
-        ^ BorrowId.Set.to_string None bid
-        ^ "} "
-        ^ symbolic_value_to_string env sv
+        "SB " ^ BorrowId.to_string bid ^ " " ^ symbolic_value_to_string env sv
 end
 
 (** Pretty-printing for contexts *)

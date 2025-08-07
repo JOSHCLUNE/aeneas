@@ -90,11 +90,11 @@ let projectors_log = create_logger "Interpreter.Projectors"
 (** Logger for InterpreterBorrows *)
 let borrows_log = create_logger "Interpreter.Borrows"
 
+(** Logger for InterpreterAbs *)
+let abs_log = create_logger "Interpreter.Abs"
+
 (** Logger for Invariants *)
 let invariants_log = create_logger "Interpreter.Invariants"
-
-(** Logger for AssociatedTypes *)
-let associated_types_log = create_logger "AssociatedTypes"
 
 (** Logger for SCC *)
 let scc_log = create_logger "Graph.SCC"

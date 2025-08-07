@@ -23,8 +23,8 @@ let log = Logging.expressions_log
 
     Note that the place should have been prepared so that there are no remaining
     loans. *)
-let expand_if_borrows_at_place (config : config) (span : Meta.span)
-    (access : access_kind) (p : place) : cm_fun =
+let expand_if_borrows_at_place (span : Meta.span) (access : access_kind)
+    (p : place) : cm_fun =
  fun ctx ->
   (* Small helper *)
   let rec expand : cm_fun =
@@ -37,7 +37,7 @@ let expand_if_borrows_at_place (config : config) (span : Meta.span)
     | None -> (ctx, fun e -> e)
     | Some sv ->
         let ctx, cc =
-          expand_symbolic_value_no_branching config span sv
+          expand_symbolic_value_no_branching span sv
             (Some (mk_mplace span p ctx))
             ctx
         in
@@ -75,7 +75,7 @@ let access_rplace_reorganize_and_read (config : config) (span : Meta.span)
    * borrows) *)
   let ctx, cc =
     comp cc
-      (if greedy_expand then expand_if_borrows_at_place config span access p ctx
+      (if greedy_expand then expand_if_borrows_at_place span access p ctx
        else (ctx, fun e -> e))
   in
   (* Read the place - note that this checks that the value doesn't contain bottoms *)
@@ -86,29 +86,41 @@ let access_rplace_reorganize_and_read (config : config) (span : Meta.span)
 let access_rplace_reorganize (config : config) (span : Meta.span)
     (greedy_expand : bool) (access : access_kind) (p : place) : cm_fun =
  fun ctx ->
-  let _, ctx, f =
-    access_rplace_reorganize_and_read config span greedy_expand access p ctx
-  in
-  (ctx, f)
+  if ExpressionsUtils.place_accesses_global p then (ctx, fun x -> x)
+  else
+    let _, ctx, f =
+      access_rplace_reorganize_and_read config span greedy_expand access p ctx
+    in
+    (ctx, f)
 
 (** Convert an operand constant operand value to a typed value *)
 let literal_to_typed_value (span : Meta.span) (ty : literal_type) (cv : literal)
-    : typed_value =
+    (ctx : eval_ctx) : typed_value =
   (* Check the type while converting - we actually need some information
    * contained in the type *)
   log#ltrace
     (lazy
       ("literal_to_typed_value:" ^ "\n- cv: "
       ^ Print.Values.literal_to_string cv));
+  let ptr_size = ctx.crate.target_information.target_pointer_size in
   match (ty, cv) with
   (* Scalar, boolean... *)
   | TBool, VBool v -> { value = VLiteral (VBool v); ty = TLiteral ty }
   | TChar, VChar v -> { value = VLiteral (VChar v); ty = TLiteral ty }
-  | TInteger int_ty, VScalar v ->
+  | TInt int_ty, VScalar (SignedScalar (sv_ty, _) as sv) ->
       (* Check the type and the ranges *)
-      sanity_check __FILE__ __LINE__ (int_ty = v.int_ty) span;
-      sanity_check __FILE__ __LINE__ (check_scalar_value_in_range v) span;
-      { value = VLiteral (VScalar v); ty = TLiteral ty }
+      sanity_check __FILE__ __LINE__ (int_ty = sv_ty) span;
+      sanity_check __FILE__ __LINE__
+        (check_scalar_value_in_range ptr_size sv)
+        span;
+      { value = VLiteral (VScalar sv); ty = TLiteral ty }
+  | TUInt int_ty, VScalar (UnsignedScalar (sv_ty, _) as sv) ->
+      (* Check the type and the ranges *)
+      sanity_check __FILE__ __LINE__ (int_ty = sv_ty) span;
+      sanity_check __FILE__ __LINE__
+        (check_scalar_value_in_range ptr_size sv)
+        span;
+      { value = VLiteral (VScalar sv); ty = TLiteral ty }
   (* Remaining cases (invalid) *)
   | _, _ -> craise __FILE__ __LINE__ span "Improperly typed constant value"
 
@@ -116,8 +128,8 @@ let literal_to_typed_value (span : Meta.span) (ty : literal_type) (cv : literal)
     it - see the remark about the symbolic values with borrows) and the
     resulting value.
 
-    Note that copying values might update the context. For instance, when
-    copying shared borrows, we need to insert new shared borrows in the context.
+    This function essentially duplicates the value while refreshing the shared
+    borrow identifiers (which uniquely identify shared borrows).
 
     Also, this function is actually more general than it should be: it can be
     used to copy concrete ADT values, while ADT copy should be done through the
@@ -202,12 +214,14 @@ let rec copy_value (span : Meta.span) (allow_adt_copy : bool) (config : config)
   | VBorrow bc -> (
       (* We can only copy shared borrows *)
       match bc with
-      | VSharedBorrow bid ->
+      | VSharedBorrow (bid, _) ->
           (* We need to create a new borrow id for the copied borrow, and
            * update the context accordingly *)
-          let bid' = fresh_borrow_id () in
-          let ctx = InterpreterBorrows.reborrow_shared span bid bid' ctx in
-          (v, { v with value = VBorrow (VSharedBorrow bid') }, ctx, fun e -> e)
+          let sid' = fresh_shared_borrow_id () in
+          ( v,
+            { v with value = VBorrow (VSharedBorrow (bid, sid')) },
+            ctx,
+            fun e -> e )
       | VMutBorrow (_, _) ->
           exec_raise __FILE__ __LINE__ span "Can't copy a mutable borrow"
       | VReservedMutBorrow _ ->
@@ -239,7 +253,12 @@ let rec copy_value (span : Meta.span) (allow_adt_copy : bool) (config : config)
       if not (ty_has_borrows (Some span) ctx.type_ctx.type_infos v.ty) then
         (* No borrows: do nothing *)
         (v, v, ctx, fun e -> e)
-      else
+      else begin
+        (* There are borrows: check that they are all live (i.e., the symbolic
+           value doesn't contain bottom) *)
+        cassert __FILE__ __LINE__
+          (not (symbolic_value_has_ended_regions ctx.ended_regions sp))
+          span "Attempted to copy a symbolic value containing ended borrows";
         let ctx0 = ctx in
         (* There are borrows: we need to introduce one region abstraction per live
            region present in the type *)
@@ -256,11 +275,7 @@ let rec copy_value (span : Meta.span) (allow_adt_copy : bool) (config : config)
               can_end = true;
               parents = AbstractionId.Set.empty;
               original_parents = [];
-              regions =
-                {
-                  owned = RegionId.Set.singleton r_id;
-                  ancestors = RegionId.Set.empty;
-                };
+              regions = { owned = RegionId.Set.singleton r_id };
               avalues;
             }
           in
@@ -273,9 +288,10 @@ let rec copy_value (span : Meta.span) (allow_adt_copy : bool) (config : config)
           List.map
             (fun rid ->
               let mk_proj (is_borrows : bool) sv_id : typed_avalue =
+                let proj : symbolic_proj = { sv_id; proj_ty = ty } in
                 let proj =
-                  if is_borrows then AProjBorrows (sv_id, ty, [])
-                  else AProjLoans (sv_id, ty, [])
+                  if is_borrows then AProjBorrows { proj; loans = [] }
+                  else AProjLoans { proj; consumed = []; borrows = [] }
                 in
                 let value = ASymbolic (PNone, proj) in
                 { value; ty }
@@ -300,6 +316,7 @@ let rec copy_value (span : Meta.span) (allow_adt_copy : bool) (config : config)
           mk_typed_value_from_symbolic_value copied_sv,
           ctx,
           cf )
+      end
 
 (** Reorganize the environment in preparation for the evaluation of an operand.
 
@@ -380,7 +397,7 @@ let eval_operand_no_reorganize (config : config) (span : Meta.span)
               let v : typed_value = { value = VLiteral lit; ty = cv.ty } in
               (v, ctx, fun e -> e)
           | TLiteral lit_ty ->
-              (literal_to_typed_value span lit_ty lit, ctx, fun e -> e)
+              (literal_to_typed_value span lit_ty lit ctx, ctx, fun e -> e)
           | _ ->
               craise __FILE__ __LINE__ span
                 ("Encountered an incorrectly typed constant: "
@@ -541,6 +558,7 @@ let eval_unary_op_concrete (config : config) (span : Meta.span) (unop : unop)
     * (SymbolicAst.expression -> SymbolicAst.expression) =
   (* Evaluate the operand *)
   let v, ctx, cc = eval_operand config span op ctx in
+  let ptr_size = ctx.crate.target_information.target_pointer_size in
   (* Apply the unop *)
   let r =
     match (unop, v.value) with
@@ -549,43 +567,53 @@ let eval_unary_op_concrete (config : config) (span : Meta.span) (unop : unop)
         (* The ! operator flips the bits.
            In effect, this does the operation we implement below.
         *)
-        let int_ty = i.int_ty in
+        let int_ty = get_ty i in
         let x =
           if integer_type_is_signed int_ty then Z.of_int (-1)
-          else scalar_max int_ty
+          else scalar_max ptr_size int_ty
         in
-        let value = Z.sub x i.value in
-        Ok { v with value = VLiteral (VScalar { value; int_ty }) }
+        let value = Z.sub x (get_val i) in
+        Ok
+          {
+            v with
+            value =
+              VLiteral
+                (VScalar (Result.get_ok (mk_scalar ptr_size int_ty value)));
+          }
     | Neg OPanic, VLiteral (VScalar sv) -> (
-        let i = Z.neg sv.value in
-        match mk_scalar sv.int_ty i with
+        let i = Z.neg (get_val sv) in
+        match mk_scalar ptr_size (get_ty sv) i with
         | Error _ -> Error EPanic
         | Ok sv -> Ok { v with value = VLiteral (VScalar sv) })
-    | ( Cast (CastScalar (TInteger src_ty, TInteger tgt_ty)),
-        VLiteral (VScalar sv) ) -> (
+    | Cast (CastScalar (src, tgt)), VLiteral (VScalar sv)
+      when literal_type_is_integer src && literal_type_is_integer tgt -> (
         (* Cast between integers *)
-        sanity_check __FILE__ __LINE__ (src_ty = sv.int_ty) span;
-        let i = sv.value in
-        match mk_scalar tgt_ty i with
+        let src_ty, tgt_ty = (literal_as_integer src, literal_as_integer tgt) in
+        sanity_check __FILE__ __LINE__ (src_ty = get_ty sv) span;
+        let i = get_val sv in
+        match mk_scalar ptr_size tgt_ty i with
         | Error _ -> Error EPanic
         | Ok sv ->
-            let ty = TLiteral (TInteger tgt_ty) in
+            let ty = TLiteral tgt in
             let value = VLiteral (VScalar sv) in
             Ok { ty; value })
-    | Cast (CastScalar (TBool, TInteger tgt_ty)), VLiteral (VBool sv) -> (
+    | Cast (CastScalar (TBool, tgt)), VLiteral (VBool sv)
+      when literal_type_is_integer tgt -> (
         (* Cast bool -> int *)
+        let tgt_ty = literal_as_integer tgt in
         let i = Z.of_int (if sv then 1 else 0) in
-        match mk_scalar tgt_ty i with
+        match mk_scalar ptr_size tgt_ty i with
         | Error _ -> Error EPanic
         | Ok sv ->
-            let ty = TLiteral (TInteger tgt_ty) in
+            let ty = TLiteral tgt in
             let value = VLiteral (VScalar sv) in
             Ok { ty; value })
-    | Cast (CastScalar (TInteger _, TBool)), VLiteral (VScalar sv) ->
+    | Cast (CastScalar (src, TBool)), VLiteral (VScalar sv)
+      when literal_type_is_integer src ->
         (* Cast int -> bool *)
         let b =
-          if Z.of_int 0 = sv.value then false
-          else if Z.of_int 1 = sv.value then true
+          if Z.of_int 0 = get_val sv then false
+          else if Z.of_int 1 = get_val sv then true
           else
             exec_raise __FILE__ __LINE__ span
               "Conversion from int to bool: out of range"
@@ -630,12 +658,12 @@ let cast_unsize_to_modified_fields (span : Meta.span) (ctx : eval_ctx)
       (* Retrieve the instantiated fields and make sure they are all the same
          but the last *)
       let fields_tys0 =
-        AssociatedTypes.ctx_type_get_inst_norm_variants_fields_etypes span ctx
-          id0 generics0
+        Contexts.ctx_type_get_instantiated_variants_fields_etypes span ctx id0
+          generics0
       in
       let fields_tys1 =
-        AssociatedTypes.ctx_type_get_inst_norm_variants_fields_etypes span ctx
-          id1 generics1
+        Contexts.ctx_type_get_instantiated_variants_fields_etypes span ctx id1
+          generics1
       in
       (* The ADTs should be structures *)
       let fields_tys0, fields_tys1 =
@@ -681,8 +709,10 @@ let eval_unary_op_symbolic (config : config) (span : Meta.span) (unop : unop)
   let res_sv_ty =
     match (unop, v.ty) with
     | Not, (TLiteral TBool as lty) -> lty
-    | Not, (TLiteral (TInteger _) as lty) -> lty
-    | Neg OPanic, (TLiteral (TInteger _) as lty) -> lty
+    | Not, (TLiteral (TInt _) as lty) -> lty
+    | Not, (TLiteral (TUInt _) as lty) -> lty
+    | Neg OPanic, (TLiteral (TInt _) as lty) -> lty
+    | Neg OPanic, (TLiteral (TUInt _) as lty) -> lty
     | Cast (CastScalar (_, tgt_ty)), _ -> TLiteral tgt_ty
     | Cast (CastUnsize (ty0, ty1, _)), _ ->
         (* If the following function succeeds, then it means the cast is well-formed
@@ -699,7 +729,7 @@ let eval_unary_op_symbolic (config : config) (span : Meta.span) (unop : unop)
   (* Synthesize the symbolic AST *)
   let cc =
     cc_comp cc
-      (synthesize_unary_op ctx unop v
+      (synthesize_unary_op span ctx unop v
          (mk_opt_place_from_op span op ctx)
          res_sv None)
   in
@@ -717,7 +747,8 @@ let eval_unary_op (config : config) (span : Meta.span) (unop : unop)
 (** Small helper for [eval_binary_op_concrete]: computes the result of applying
     the binop *after* the operands have been successfully evaluated *)
 let eval_binary_op_concrete_compute (span : Meta.span) (binop : binop)
-    (v1 : typed_value) (v2 : typed_value) : (typed_value, eval_error) result =
+    (v1 : typed_value) (v2 : typed_value) (ctx : eval_ctx) :
+    (typed_value, eval_error) result =
   (* Equality check binops (Eq, Ne) accept values from a wide variety of types.
    * The remaining binops only operate on scalars. *)
   if binop = Eq || binop = Ne then (
@@ -733,6 +764,9 @@ let eval_binary_op_concrete_compute (span : Meta.span) (binop : binop)
     (* For the non-equality operations, the input values are necessarily scalars *)
     match (v1.value, v2.value) with
     | VLiteral (VScalar sv1), VLiteral (VScalar sv2) -> begin
+        let ptr_size = ctx.crate.target_information.target_pointer_size in
+        let sv1_value, sv2_value = (get_val sv1, get_val sv2) in
+        let sv1_int_ty, sv2_int_ty = (get_ty sv1, get_ty sv2) in
         (* There are binops which require the two operands to have the same
            type, and binops for which it is not the case.
            There are also binops which return booleans, and binops which
@@ -741,13 +775,13 @@ let eval_binary_op_concrete_compute (span : Meta.span) (binop : binop)
         match binop with
         | Lt | Le | Ge | Gt ->
             (* The two operands must have the same type and the result is a boolean *)
-            sanity_check __FILE__ __LINE__ (sv1.int_ty = sv2.int_ty) span;
+            sanity_check __FILE__ __LINE__ (sv1_int_ty = sv2_int_ty) span;
             let b =
               match binop with
-              | Lt -> Z.lt sv1.value sv2.value
-              | Le -> Z.leq sv1.value sv2.value
-              | Ge -> Z.geq sv1.value sv2.value
-              | Gt -> Z.gt sv1.value sv2.value
+              | Lt -> Z.lt sv1_value sv2_value
+              | Le -> Z.leq sv1_value sv2_value
+              | Ge -> Z.geq sv1_value sv2_value
+              | Gt -> Z.gt sv1_value sv2_value
               | _ -> craise __FILE__ __LINE__ span "Unreachable"
             in
             Ok
@@ -760,19 +794,22 @@ let eval_binary_op_concrete_compute (span : Meta.span) (binop : binop)
         | Mul OPanic
         | BitXor | BitAnd | BitOr -> (
             (* The two operands must have the same type and the result is an integer *)
-            sanity_check __FILE__ __LINE__ (sv1.int_ty = sv2.int_ty) span;
+            sanity_check __FILE__ __LINE__ (sv1_int_ty = sv2_int_ty) span;
             let res : _ result =
               match binop with
               | Div OPanic ->
-                  if sv2.value = Z.zero then Error ()
-                  else mk_scalar sv1.int_ty (Z.div sv1.value sv2.value)
+                  if sv2_value = Z.zero then Error ()
+                  else mk_scalar ptr_size sv1_int_ty (Z.div sv1_value sv2_value)
               | Rem OPanic ->
                   (* See [https://github.com/ocaml/Zarith/blob/master/z.mli] *)
-                  if sv2.value = Z.zero then Error ()
-                  else mk_scalar sv1.int_ty (Z.rem sv1.value sv2.value)
-              | Add OPanic -> mk_scalar sv1.int_ty (Z.add sv1.value sv2.value)
-              | Sub OPanic -> mk_scalar sv1.int_ty (Z.sub sv1.value sv2.value)
-              | Mul OPanic -> mk_scalar sv1.int_ty (Z.mul sv1.value sv2.value)
+                  if sv2_value = Z.zero then Error ()
+                  else mk_scalar ptr_size sv1_int_ty (Z.rem sv1_value sv2_value)
+              | Add OPanic ->
+                  mk_scalar ptr_size sv1_int_ty (Z.add sv1_value sv2_value)
+              | Sub OPanic ->
+                  mk_scalar ptr_size sv1_int_ty (Z.sub sv1_value sv2_value)
+              | Mul OPanic ->
+                  mk_scalar ptr_size sv1_int_ty (Z.mul sv1_value sv2_value)
               | BitXor -> raise Unimplemented
               | BitAnd -> raise Unimplemented
               | BitOr -> raise Unimplemented
@@ -784,7 +821,7 @@ let eval_binary_op_concrete_compute (span : Meta.span) (binop : binop)
                 Ok
                   {
                     value = VLiteral (VScalar sv);
-                    ty = TLiteral (TInteger sv1.int_ty);
+                    ty = TLiteral (integer_as_literal sv1_int_ty);
                   })
         | Ne | Eq -> craise __FILE__ __LINE__ span "Unreachable"
         | _ ->
@@ -803,7 +840,7 @@ let eval_binary_op_concrete (config : config) (span : Meta.span) (binop : binop)
   (* Evaluate the operands *)
   let (v1, v2), ctx, cc = eval_two_operands config span op1 op2 ctx in
   (* Compute the result of the binop *)
-  let r = eval_binary_op_concrete_compute span binop v1 v2 in
+  let r = eval_binary_op_concrete_compute span binop v1 v2 ctx in
   (* Return *)
   (r, ctx, cc)
 
@@ -827,24 +864,26 @@ let eval_binary_op_symbolic (config : config) (span : Meta.span) (binop : binop)
     else
       (* Other operations: input types are integers *)
       match (v1.ty, v2.ty) with
-      | TLiteral (TInteger int_ty1), TLiteral (TInteger int_ty2) -> (
+      | TLiteral lty1, TLiteral lty2
+        when literal_type_is_integer lty1 && literal_type_is_integer lty2 -> (
+          let int_ty1, int_ty2 = (ty_as_integer v1.ty, ty_as_integer v2.ty) in
           match binop with
           | Lt | Le | Ge | Gt ->
               sanity_check __FILE__ __LINE__ (int_ty1 = int_ty2) span;
               TLiteral TBool
           | Div _ | Rem _ | Add _ | Sub _ | Mul _ | BitXor | BitAnd | BitOr ->
               sanity_check __FILE__ __LINE__ (int_ty1 = int_ty2) span;
-              TLiteral (TInteger int_ty1)
+              TLiteral (integer_as_literal int_ty1)
           | Cmp ->
               sanity_check __FILE__ __LINE__ (int_ty1 = int_ty2) span;
-              TLiteral (TInteger I8)
+              TLiteral (TInt I8)
           (* These return `(int, bool)` / a pointer which isn't a literal type *)
           | AddChecked | SubChecked | MulChecked | Offset ->
               craise __FILE__ __LINE__ span "Unimplemented binary operation"
           | Shl _ | Shr _ ->
               (* The number of bits can be of a different integer type
                  than the operand *)
-              TLiteral (TInteger int_ty1)
+              TLiteral (integer_as_literal int_ty1)
           | Ne | Eq -> craise __FILE__ __LINE__ span "Unreachable")
       | _ -> craise __FILE__ __LINE__ span "Invalid inputs for binop"
   in
@@ -854,7 +893,7 @@ let eval_binary_op_symbolic (config : config) (span : Meta.span) (binop : binop)
   let p1 = mk_opt_place_from_op span op1 ctx in
   let p2 = mk_opt_place_from_op span op2 ctx in
   let cc =
-    cc_comp cc (synthesize_binary_op ctx binop v1 p1 v2 p2 res_sv None)
+    cc_comp cc (synthesize_binary_op span ctx binop v1 p1 v2 p2 res_sv None)
   in
   (* Compose and apply *)
   (Ok v, ctx, cc)
@@ -898,19 +937,19 @@ let eval_rvalue_ref (config : config) (span : Meta.span) (p : place)
       let v, ctx, cc =
         access_rplace_reorganize_and_read config span greedy_expand access p ctx
       in
-      (* Generate the fresh borrow id *)
-      let bid = fresh_borrow_id () in
+      (* Generate the fresh shared borrow id *)
+      let sid = fresh_shared_borrow_id () in
       (* Compute the loan value, with which to replace the value at place p *)
-      let nv =
+      let bid, nv =
         match v.value with
-        | VLoan (VSharedLoan (bids, sv)) ->
-            (* Shared loan: insert the new borrow id *)
-            let bids1 = BorrowId.Set.add bid bids in
-            { v with value = VLoan (VSharedLoan (bids1, sv)) }
+        | VLoan (VSharedLoan (bid, _)) ->
+            (* The value is a shared loan: we do not need to do anything *)
+            (bid, v)
         | _ ->
             (* Not a shared loan: add a wrapper *)
-            let v' = VLoan (VSharedLoan (BorrowId.Set.singleton bid, v)) in
-            { v with value = v' }
+            let bid = fresh_borrow_id () in
+            let v' = VLoan (VSharedLoan (bid, v)) in
+            (bid, { v with value = v' })
       in
       (* Update the value in the context to replace it with the loan *)
       let ctx = write_place span access p nv ctx in
@@ -928,8 +967,8 @@ let eval_rvalue_ref (config : config) (span : Meta.span) (p : place)
         | BShared | BShallow ->
             (* See the remark at the beginning of the match branch: we
                handle shallow borrows like shared borrows *)
-            VSharedBorrow bid
-        | BTwoPhaseMut -> VReservedMutBorrow bid
+            VSharedBorrow (bid, sid)
+        | BTwoPhaseMut -> VReservedMutBorrow (bid, sid)
         | _ -> craise __FILE__ __LINE__ span "Unreachable"
       in
       let rv : typed_value = { value = VBorrow bc; ty = rv_ty } in
@@ -985,8 +1024,8 @@ let eval_rvalue_aggregate (config : config) (span : Meta.span)
               = List.length generics.regions)
               span;
             let expected_field_types =
-              AssociatedTypes.ctx_type_get_inst_norm_field_etypes span ctx
-                def_id opt_variant_id generics
+              ctx_type_get_instantiated_field_etypes span ctx def_id
+                opt_variant_id generics
             in
             sanity_check __FILE__ __LINE__
               (expected_field_types
@@ -1016,7 +1055,7 @@ let eval_rvalue_aggregate (config : config) (span : Meta.span)
                    values)
             ^ "]"));
         (* Sanity check: the number of values is consistent with the length *)
-        let len = (literal_as_scalar (const_generic_as_literal cg)).value in
+        let len = get_val (literal_as_scalar (const_generic_as_literal cg)) in
         sanity_check __FILE__ __LINE__
           (len = Z.of_int (List.length values))
           span;
@@ -1071,7 +1110,6 @@ let eval_rvalue_not_global (config : config) (span : Meta.span)
       craise __FILE__ __LINE__ span
         "Unreachable: discriminant reads should have been eliminated from the \
          AST"
-  | Global _ -> craise __FILE__ __LINE__ span "Unreachable"
   | Len _ -> craise __FILE__ __LINE__ span "Unhandled Len"
   | _ ->
       craise __FILE__ __LINE__ span

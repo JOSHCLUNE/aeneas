@@ -32,9 +32,7 @@ let fresh_regions_with_substs_from_vars (region_vars : region_var list)
     fresh_region_id
 
 (** Substitute a function signature, together with the regions hierarchy
-    associated to that signature.
-
-    **IMPORTANT:** this function doesn't normalize the types. *)
+    associated to that signature. *)
 let substitute_signature (asubst : RegionGroupId.id -> AbstractionId.id)
     (r_id_subst : RegionId.id -> RegionId.id) (ty_sb_subst : TypeVarId.id -> ty)
     (cg_sb_subst : ConstGenericVarId.id -> const_generic)
@@ -84,6 +82,7 @@ type id_subst = {
   cg_subst : ConstGenericVarId.id -> ConstGenericVarId.id;
   ssubst : SymbolicValueId.id -> SymbolicValueId.id;
   bsubst : BorrowId.id -> BorrowId.id;
+  sbsubst : SharedBorrowId.id -> SharedBorrowId.id;
   asubst : AbstractionId.id -> AbstractionId.id;
 }
 
@@ -94,6 +93,7 @@ let empty_id_subst =
     cg_subst = (fun x -> x);
     ssubst = (fun x -> x);
     bsubst = (fun x -> x);
+    sbsubst = (fun x -> x);
     asubst = (fun x -> x);
   }
 
@@ -113,10 +113,9 @@ let subst_ids_visitor (subst : id_subst) =
          cases that contain region ids earlier."
 
     method! visit_abs_regions _ regions =
-      let { owned; ancestors } = regions in
+      let { owned } = regions in
       let owned = RegionId.Set.map subst.r_subst owned in
-      let ancestors = RegionId.Set.map subst.r_subst ancestors in
-      { owned; ancestors }
+      { owned }
 
     method! visit_RVar _ var =
       match var with
@@ -124,6 +123,7 @@ let subst_ids_visitor (subst : id_subst) =
       | Bound _ -> RVar var
 
     method! visit_borrow_id _ bid = subst.bsubst bid
+    method! visit_shared_borrow_id _ sid = subst.sbsubst sid
     method! visit_loan_id _ bid = subst.bsubst bid
     method! visit_symbolic_value_id _ id = subst.ssubst id
 

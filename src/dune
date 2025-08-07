@@ -17,7 +17,6 @@
   (pps ppx_deriving.show ppx_deriving.ord visitors.ppx))
  (libraries charon core_unix ocamlgraph str)
  (modules
-  AssociatedTypes
   BorrowCheck
   Builtin
   Collections
@@ -37,6 +36,7 @@
   ExtractTypes
   FunsAnalysis
   Identifiers
+  InterpreterAbs
   InterpreterBorrowsCore
   InterpreterBorrows
   InterpreterExpansion
@@ -74,6 +74,10 @@
   Substitute
   SymbolicAst
   SymbolicToPure
+  SymbolicToPureCore
+  SymbolicToPureExpressions
+  SymbolicToPureTypes
+  SymbolicToPureValues
   SynthesizeSymbolic
   TranslateCore
   Translate
@@ -95,7 +99,9 @@
    -g
    ;-dsource
    -warn-error
-   -3-5@8-11-14-33-20-21-26-27-39))
+   -3-5@8-11-14-33-20-21-26-27-39
+   -w
+   -30))
  (release
   (flags
    :standard
@@ -103,4 +109,6 @@
    -g
    ;-dsource
    -warn-error
-   -3-5@8-11-14-33-20-21-26-27-39)))
+   -3-5@8-11-14-33-20-21-26-27-39
+   -w
+   -30)))
